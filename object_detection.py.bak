@@ -1,0 +1,103 @@
+import cv2
+import numpy as np
+import time
+
+# Load model
+net = cv2.dnn.readNet("object_detection_model/weights/yolov3-tiny.weights",
+                      "object_detection_model/config/yolov3-tiny.cfg")
+
+# sanity check that net loaded
+if net.empty():
+    raise RuntimeError("Failed to load network. Check weights/cfg path.")
+
+# load class labels
+with open("object_detection_model/objectLabels/coco.names", "r") as f:
+    label_classes = [c.strip() for c in f.readlines()]
+
+layer_names = net.getLayerNames()
+# getUnconnectedOutLayers may return [[82],[94],[106]] or [82,94,106]
+unconnected = net.getUnconnectedOutLayers()
+# convert to flat list of ints
+try:
+    out_layers = [layer_names[i - 1] for i in unconnected.flatten()]
+except:
+    # fallback if it's already a simple list/tuple
+    out_layers = [layer_names[int(i) - 1] for i in unconnected]
+
+print("Output layers:", out_layers)  # debug: remove later
+
+colors = np.random.uniform(0, 255, size=(len(label_classes), 3))
+font = cv2.FONT_HERSHEY_PLAIN
+
+def detectObject(frame,
+                 conf_threshold=0.3,    # lower for tiny model while testing
+                 nms_threshold=0.4,
+                 inp_width=416, inp_height=416,
+                 draw=True):
+    """
+    Returns labels_this_frame: list of tuples (label, confidence, box)
+    box = (x, y, w, h)
+    """
+    labels_this_frame = []
+    height, width = frame.shape[:2]
+
+    # Use a standard YOLO input size (416 or 320). 220 is non-standard.
+    blob = cv2.dnn.blobFromImage(frame, scalefactor=1/255.0,
+                                 size=(inp_width, inp_height),
+                                 mean=(0, 0, 0), swapRB=True, crop=False)
+
+    net.setInput(blob)
+    outs = net.forward(out_layers)
+
+    class_ids = []
+    confidences = []
+    boxes = []
+
+    for out in outs:
+        for detection in out:
+            # detection: [center_x, center_y, width, height, objectness, class_scores...]
+            scores = detection[5:]
+            class_id = int(np.argmax(scores))
+            class_score = float(scores[class_id])
+            objectness = float(detection[4])
+            confidence = objectness * class_score  # combine objectness with class confidence
+
+            if confidence > conf_threshold:
+                cx = int(detection[0] * width)
+                cy = int(detection[1] * height)
+                w = int(detection[2] * width)
+                h = int(detection[3] * height)
+                x = int(cx - w / 2)
+                y = int(cy - h / 2)
+
+                boxes.append([x, y, w, h])
+                confidences.append(float(confidence))
+                class_ids.append(class_id)
+
+    # NMS - handle different return shapes robustly
+    if len(boxes) > 0:
+        indexes = cv2.dnn.NMSBoxes(boxes, confidences, conf_threshold, nms_threshold)
+        # indexes might be a list of lists or a numpy array; flatten safely:
+        if isinstance(indexes, (np.ndarray, list)):
+            try:
+                flat = indexes.flatten()
+            except:
+                # if it's a list of lists like [[3],[7]]
+                flat = [i[0] if isinstance(i, (list, tuple, np.ndarray)) else i for i in indexes]
+        else:
+            flat = []
+
+        for i in flat:
+            i = int(i)
+            x, y, w, h = boxes[i]
+            label = label_classes[class_ids[i]] if class_ids[i] < len(label_classes) else str(class_ids[i])
+            conf = confidences[i]
+            labels_this_frame.append((label, conf, (x, y, w, h)))
+
+            if draw:
+                color = colors[class_ids[i] % len(colors)].astype(int).tolist()
+                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                text = f"{label}: {conf:.2f}"
+                cv2.putText(frame, text, (x, y - 5), font, 1.0, color, 2)
+
+    return labels_this_frame
